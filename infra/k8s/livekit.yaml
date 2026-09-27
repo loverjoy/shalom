@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: livekit
+  labels:
+    app: livekit
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: livekit
+  template:
+    metadata:
+      labels:
+        app: livekit
+    spec:
+      containers:
+        - name: livekit
+          image: livekit/livekit-server:latest
+          ports:
+            - containerPort: 7880
+            - containerPort: 7881
+            - containerPort: 50000
+              protocol: UDP
+          args:
+            - --config
+            - /etc/livekit.yaml
+            - --bind
+            - "0.0.0.0"
+          volumeMounts:
+            - name: livekit-config
+              mountPath: /etc/livekit.yaml
+              subPath: livekit.yaml
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+      volumes:
+        - name: livekit-config
+          configMap:
+            name: livekit-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: livekit-service
+spec:
+  selector:
+    app: livekit
+  ports:
+    - port: 7880
+      targetPort: 7880
+      name: http
+    - port: 7881
+      targetPort: 7881
+      name: rtc
+    - port: 50000
+      targetPort: 50000
+      protocol: UDP
+      name: udp
+  type: ClusterIP
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: livekit-config
+data:
+  livekit.yaml: |
+    rtc_port: 7880
+    keys:
+      devkey: devsecret
+    room:
+      auto_create: true
+      empty_timeout: 300
+      max_participants: 500
+      enable_remote_unmute: true
+      video_simulcast: true
+      video_quality:
+        default_height: 360
+        max_height: 1080
+        min_height: 144

@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shalom-backend
+  labels:
+    app: shalom-backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: shalom-backend
+  template:
+    metadata:
+      labels:
+        app: shalom-backend
+    spec:
+      containers:
+        - name: backend
+          image: shalom/backend:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: SERVER_PORT
+              value: "8080"
+            - name: POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: shalom-secrets
+                  key: postgres-url
+            - name: MONGO_URL
+              valueFrom:
+                secretKeyRef:
+                  name: shalom-secrets
+                  key: mongo-url
+            - name: REDIS_ADDR
+              value: "redis-service:6379"
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: shalom-secrets
+                  key: jwt-secret
+            - name: LIVEKIT_URL
+              value: "ws://livekit-service:7880"
+            - name: LIVEKIT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: shalom-secrets
+                  key: livekit-api-key
+            - name: LIVEKIT_API_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: shalom-secrets
+                  key: livekit-api-secret
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+spec:
+  selector:
+    app: shalom-backend
+  ports:
+    - port: 8080
+      targetPort: 8080
+  type: ClusterIP

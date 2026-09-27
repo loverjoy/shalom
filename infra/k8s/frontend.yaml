@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shalom-frontend
+  labels:
+    app: shalom-frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: shalom-frontend
+  template:
+    metadata:
+      labels:
+        app: shalom-frontend
+    spec:
+      containers:
+        - name: frontend
+          image: shalom/frontend:latest
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-service
+spec:
+  selector:
+    app: shalom-frontend
+  ports:
+    - port: 80
+      targetPort: 80
+  type: LoadBalancer
