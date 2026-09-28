@@ -1,9 +1,8 @@
 FROM golang:1.22-alpine AS builder
 WORKDIR /app
 COPY go.mod ./
-RUN go mod download
-COPY . .
 RUN go mod tidy
+COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o server ./cmd/api-gateway
 
 FROM alpine:3.19
