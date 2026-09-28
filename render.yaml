@@ -1,0 +1,50 @@
+services:
+  - type: web
+    name: shalom-backend
+    runtime: docker
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: SERVER_PORT
+        value: 8080
+      - key: POSTGRES_URL
+        fromDatabase:
+          name: shalom-db
+          property: connectionString
+      - key: MONGO_URL
+        sync: false
+      - key: MONGO_DB
+        value: shalom_chat
+      - key: REDIS_URL
+        fromRedis:
+          name: shalom-redis
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: LIVEKIT_URL
+        value: wss://livekit.shalom.app
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+
+  - type: web
+    name: shalom-frontend
+    runtime: static
+    rootDir: frontend
+    staticPublishPath: ./dist
+    buildCommand: npm install && npm run build
+    envVars:
+      - key: NODE_ENV
+        value: production
+
+  - type: postgres
+    name: shalom-db
+    plan: starter
+    databaseName: shalom
+    user: shalom
+
+  - type: redis
+    name: shalom-redis
+    plan: starter
+    ipAllowList: []
