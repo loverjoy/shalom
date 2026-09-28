@@ -2,36 +2,40 @@ package service
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/livekit/protocol/auth"
-	lksdk "github.com/livekit/server-sdk-go"
 
 	"shalom/internal/config"
 	"shalom/internal/models"
+	"shalom/internal/repository"
 )
 
 type MeetingService struct {
-	db      *pgxpool.Pool
-	config  *config.Config
+	config      *config.Config
+	meetingRepo *repository.MeetingRepository
 }
 
-func NewMeetingService(db *pgxpool.Pool, cfg *config.Config) *MeetingService {
-	return &MeetingService{db: db, config: cfg}
+func NewMeetingService(cfg *config.Config, meetingRepo *repository.MeetingRepository) *MeetingService {
+	return &MeetingService{config: cfg, meetingRepo: meetingRepo}
 }
 
 type CreateMeetingRequest struct {
 	Title           string     `json:"title" binding:"required"`
 	Description     string     `json:"description"`
 	MaxParticipants int        `json:"max_participants"`
+	IsWaitingRoom   bool       `json:"is_waiting_room"`
+	Password        string     `json:"password"`
 	ScheduledAt     *time.Time `json:"scheduled_at"`
 }
 
 type JoinMeetingRequest struct {
 	MeetingCode string `json:"meeting_code" binding:"required"`
+	Password    string `json:"password"`
 }
 
 type MeetingResponse struct {
@@ -48,31 +52,37 @@ func (s *MeetingService) CreateMeeting(ctx context.Context, hostID uuid.UUID, re
 		maxParticipants = 500
 	}
 
-	meeting := models.Meeting{}
-	err := s.db.QueryRow(ctx,
-		`INSERT INTO meetings (id, title, description, host_id, meeting_code, join_link, status, max_participants, scheduled_at, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, 'scheduled', $7, $8, NOW(), NOW())
-		 RETURNING id, title, description, host_id, meeting_code, join_link, status, max_participants, scheduled_at, created_at, updated_at`,
-		uuid.New(), req.Title, req.Description, hostID, code, "/meet/"+code, maxParticipants, req.ScheduledAt,
-	).Scan(&meeting.ID, &meeting.Title, &meeting.Description, &meeting.HostID, &meeting.MeetingCode, &meeting.JoinLink, &meeting.Status, &meeting.MaxParticipants, &meeting.ScheduledAt, &meeting.CreatedAt, &meeting.UpdatedAt)
-	if err != nil {
+	meeting := &models.Meeting{
+		ID:              uuid.New(),
+		Title:           req.Title,
+		Description:     req.Description,
+		HostID:          hostID,
+		MeetingCode:     code,
+		JoinLink:        "/meet/" + code,
+		Status:          models.MeetingScheduled,
+		MaxParticipants: maxParticipants,
+		IsWaitingRoom:   req.IsWaitingRoom,
+		Password:        req.Password,
+		ScheduledAt:     req.ScheduledAt,
+	}
+
+	if err := s.meetingRepo.Create(ctx, meeting); err != nil {
 		return nil, err
 	}
 
-	s.db.Exec(ctx,
-		`INSERT INTO meeting_participants (id, meeting_id, user_id, role, joined_at) VALUES ($1, $2, $3, 'host', NOW())`,
-		uuid.New(), meeting.ID, hostID,
-	)
+	// Add host as participant
+	s.meetingRepo.AddParticipant(ctx, &models.MeetingParticipant{
+		ID:        uuid.New(),
+		MeetingID: meeting.ID,
+		UserID:    hostID,
+		Role:      models.RoleHost,
+	})
 
-	return &meeting, nil
+	return meeting, nil
 }
 
 func (s *MeetingService) StartMeeting(ctx context.Context, meetingID, userID uuid.UUID) (*MeetingResponse, error) {
-	var meeting models.Meeting
-	err := s.db.QueryRow(ctx,
-		`SELECT id, title, description, host_id, meeting_code, join_link, status, max_participants, scheduled_at, created_at, updated_at
-		 FROM meetings WHERE id = $1`, meetingID,
-	).Scan(&meeting.ID, &meeting.Title, &meeting.Description, &meeting.HostID, &meeting.MeetingCode, &meeting.JoinLink, &meeting.Status, &meeting.MaxParticipants, &meeting.ScheduledAt, &meeting.CreatedAt, &meeting.UpdatedAt)
+	meeting, err := s.meetingRepo.GetByID(ctx, meetingID)
 	if err != nil {
 		return nil, errors.New("meeting not found")
 	}
@@ -81,8 +91,8 @@ func (s *MeetingService) StartMeeting(ctx context.Context, meetingID, userID uui
 		return nil, errors.New("only host can start meeting")
 	}
 
-	s.db.Exec(ctx, `UPDATE meetings SET status = 'active', started_at = NOW(), updated_at = NOW() WHERE id = $1`, meetingID)
-	meeting.Status = "active"
+	s.meetingRepo.UpdateStatus(ctx, meetingID, models.MeetingActive)
+	meeting.Status = models.MeetingActive
 
 	roomName := "meeting-" + meeting.MeetingCode
 	token, err := s.generateLiveKitToken(userID, roomName, true)
@@ -90,126 +100,151 @@ func (s *MeetingService) StartMeeting(ctx context.Context, meetingID, userID uui
 		return nil, err
 	}
 
-	return &MeetingResponse{Meeting: meeting, Token: token, RoomName: roomName}, nil
+	return &MeetingResponse{Meeting: *meeting, Token: token, RoomName: roomName}, nil
 }
 
 func (s *MeetingService) JoinMeeting(ctx context.Context, userID uuid.UUID, req JoinMeetingRequest) (*MeetingResponse, error) {
-	var meeting models.Meeting
-	err := s.db.QueryRow(ctx,
-		`SELECT id, title, description, host_id, meeting_code, join_link, status, max_participants, scheduled_at, created_at, updated_at
-		 FROM meetings WHERE meeting_code = $1`, req.MeetingCode,
-	).Scan(&meeting.ID, &meeting.Title, &meeting.Description, &meeting.HostID, &meeting.MeetingCode, &meeting.JoinLink, &meeting.Status, &meeting.MaxParticipants, &meeting.ScheduledAt, &meeting.CreatedAt, &meeting.UpdatedAt)
+	meeting, err := s.meetingRepo.GetByCode(ctx, req.MeetingCode)
 	if err != nil {
 		return nil, errors.New("meeting not found")
 	}
 
-	if meeting.Status == "ended" {
+	if meeting.Status == models.MeetingEnded {
 		return nil, errors.New("meeting has ended")
 	}
 
-	var count int
-	s.db.QueryRow(ctx, `SELECT COUNT(*) FROM meeting_participants WHERE meeting_id = $1 AND left_at IS NULL`, meeting.ID).Scan(&count)
+	// Check password
+	if meeting.Password != "" && meeting.Password != req.Password {
+		return nil, errors.New("invalid meeting password")
+	}
+
+	// Check capacity
+	count, err := s.meetingRepo.GetActiveCount(ctx, meeting.ID)
+	if err != nil {
+		return nil, err
+	}
 	if count >= meeting.MaxParticipants {
 		return nil, errors.New("meeting is full")
 	}
 
-	role := "listener"
+	// Determine role
+	role := models.RoleListener
 	if meeting.HostID == userID {
-		role = "host"
+		role = models.RoleHost
 	}
 
-	s.db.Exec(ctx,
-		`INSERT INTO meeting_participants (id, meeting_id, user_id, role, joined_at)
-		 VALUES ($1, $2, $3, $4, NOW())
-		 ON CONFLICT (meeting_id, user_id) DO UPDATE SET left_at = NULL`,
-		uuid.New(), meeting.ID, userID, role,
-	)
+	// Handle waiting room
+	if meeting.IsWaitingRoom && role != models.RoleHost {
+		s.meetingRepo.AddToWaitingRoom(ctx, meeting.ID, userID)
+		return &MeetingResponse{Meeting: *meeting, Token: "", RoomName: ""}, nil
+	}
+
+	s.meetingRepo.AddParticipant(ctx, &models.MeetingParticipant{
+		ID:        uuid.New(),
+		MeetingID: meeting.ID,
+		UserID:    userID,
+		Role:      role,
+	})
+
+	// Log attendance
+	s.meetingRepo.LogAttendance(ctx, meeting.ID, userID)
 
 	roomName := "meeting-" + meeting.MeetingCode
-	token, err := s.generateLiveKitToken(userID, roomName, role == "host" || role == "cohost")
+	token, err := s.generateLiveKitToken(userID, roomName, role == models.RoleHost || role == models.RoleCohost)
 	if err != nil {
 		return nil, err
 	}
 
-	return &MeetingResponse{Meeting: meeting, Token: token, RoomName: roomName}, nil
+	return &MeetingResponse{Meeting: *meeting, Token: token, RoomName: roomName}, nil
 }
 
 func (s *MeetingService) EndMeeting(ctx context.Context, meetingID, userID uuid.UUID) error {
-	var hostID uuid.UUID
-	err := s.db.QueryRow(ctx, `SELECT host_id FROM meetings WHERE id = $1`, meetingID).Scan(&hostID)
+	meeting, err := s.meetingRepo.GetByID(ctx, meetingID)
 	if err != nil {
 		return errors.New("meeting not found")
 	}
-	if hostID != userID {
+
+	if meeting.HostID != userID {
 		return errors.New("only host can end meeting")
 	}
-	s.db.Exec(ctx, `UPDATE meetings SET status = 'ended', ended_at = NOW(), updated_at = NOW() WHERE id = $1`, meetingID)
-	s.db.Exec(ctx, `UPDATE meeting_participants SET left_at = NOW() WHERE meeting_id = $1 AND left_at IS NULL`, meetingID)
-	return nil
+
+	return s.meetingRepo.UpdateStatus(ctx, meetingID, models.MeetingEnded)
 }
 
 func (s *MeetingService) GetMeeting(ctx context.Context, meetingID uuid.UUID) (*models.Meeting, error) {
-	var meeting models.Meeting
-	err := s.db.QueryRow(ctx,
-		`SELECT id, title, description, host_id, meeting_code, join_link, status, max_participants, scheduled_at, started_at, ended_at, created_at, updated_at
-		 FROM meetings WHERE id = $1`, meetingID,
-	).Scan(&meeting.ID, &meeting.Title, &meeting.Description, &meeting.HostID, &meeting.MeetingCode, &meeting.JoinLink, &meeting.Status, &meeting.MaxParticipants, &meeting.ScheduledAt, &meeting.StartedAt, &meeting.EndedAt, &meeting.CreatedAt, &meeting.UpdatedAt)
-	if err != nil {
-		return nil, err
-	}
-	return &meeting, nil
+	return s.meetingRepo.GetByID(ctx, meetingID)
 }
 
 func (s *MeetingService) GetParticipants(ctx context.Context, meetingID uuid.UUID) ([]models.MeetingParticipant, error) {
-	rows, err := s.db.Query(ctx,
-		`SELECT id, meeting_id, user_id, role, is_muted, is_video_on, is_screen_share, hand_raised, joined_at, left_at
-		 FROM meeting_participants WHERE meeting_id = $1 ORDER BY joined_at`, meetingID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var participants []models.MeetingParticipant
-	for rows.Next() {
-		var p models.MeetingParticipant
-		rows.Scan(&p.ID, &p.MeetingID, &p.UserID, &p.Role, &p.IsMuted, &p.IsVideoOn, &p.IsScreenShare, &p.HandRaised, &p.JoinedAt, &p.LeftAt)
-		participants = append(participants, p)
-	}
-	return participants, nil
+	return s.meetingRepo.GetParticipants(ctx, meetingID)
 }
 
 func (s *MeetingService) UpdateParticipant(ctx context.Context, meetingID, userID uuid.UUID, isMuted, isVideoOn, isScreenShare, handRaised *bool) error {
+	fields := make(map[string]interface{})
 	if isMuted != nil {
-		s.db.Exec(ctx, `UPDATE meeting_participants SET is_muted = $1 WHERE meeting_id = $2 AND user_id = $3`, *isMuted, meetingID, userID)
+		fields["is_muted"] = *isMuted
 	}
 	if isVideoOn != nil {
-		s.db.Exec(ctx, `UPDATE meeting_participants SET is_video_on = $1 WHERE meeting_id = $2 AND user_id = $3`, *isVideoOn, meetingID, userID)
+		fields["is_video_on"] = *isVideoOn
 	}
 	if isScreenShare != nil {
-		s.db.Exec(ctx, `UPDATE meeting_participants SET is_screen_share = $1 WHERE meeting_id = $2 AND user_id = $3`, *isScreenShare, meetingID, userID)
+		fields["is_screen_share"] = *isScreenShare
 	}
 	if handRaised != nil {
-		s.db.Exec(ctx, `UPDATE meeting_participants SET hand_raised = $1 WHERE meeting_id = $2 AND user_id = $3`, *handRaised, meetingID, userID)
+		fields["hand_raised"] = *handRaised
 	}
-	return nil
+	if len(fields) == 0 {
+		return nil
+	}
+	return s.meetingRepo.UpdateParticipant(ctx, meetingID, userID, fields)
 }
 
 func (s *MeetingService) KickParticipant(ctx context.Context, meetingID, hostID, targetID uuid.UUID) error {
-	var hostRole string
-	err := s.db.QueryRow(ctx,
-		`SELECT role FROM meeting_participants WHERE meeting_id = $1 AND user_id = $2`, meetingID, hostID,
-	).Scan(&hostRole)
-	if err != nil || (hostRole != "host" && hostRole != "cohost") {
+	role, err := s.meetingRepo.GetRole(ctx, meetingID, hostID)
+	if err != nil || (role != string(models.RoleHost) && role != string(models.RoleCohost)) {
 		return errors.New("insufficient permissions")
 	}
-	s.db.Exec(ctx,
-		`UPDATE meeting_participants SET left_at = NOW() WHERE meeting_id = $1 AND user_id = $2`, meetingID, targetID,
-	)
-	return nil
+	return s.meetingRepo.BanParticipant(ctx, meetingID, targetID)
+}
+
+func (s *MeetingService) AdmitFromWaitingRoom(ctx context.Context, meetingID, hostID, targetID uuid.UUID) error {
+	role, err := s.meetingRepo.GetRole(ctx, meetingID, hostID)
+	if err != nil || (role != string(models.RoleHost) && role != string(models.RoleCohost)) {
+		return errors.New("insufficient permissions")
+	}
+
+	if err := s.meetingRepo.AdmitFromWaitingRoom(ctx, meetingID, targetID, hostID); err != nil {
+		return err
+	}
+
+	return s.meetingRepo.AddParticipant(ctx, &models.MeetingParticipant{
+		ID:        uuid.New(),
+		MeetingID: meetingID,
+		UserID:    targetID,
+		Role:      models.RoleListener,
+	})
+}
+
+func (s *MeetingService) GetWaitingRoom(ctx context.Context, meetingID uuid.UUID) ([]models.WaitingRoomEntry, error) {
+	return s.meetingRepo.GetWaitingRoom(ctx, meetingID)
+}
+
+func (s *MeetingService) GetRecordings(ctx context.Context, meetingID uuid.UUID) ([]models.Recording, error) {
+	return s.meetingRepo.GetRecordings(ctx, meetingID)
+}
+
+func (s *MeetingService) GetAttendance(ctx context.Context, meetingID uuid.UUID) ([]models.Attendance, error) {
+	return s.meetingRepo.GetAttendance(ctx, meetingID)
+}
+
+func generateMeetingCode() string {
+	b := make([]byte, 4)
+	rand.Read(b)
+	return hex.EncodeToString(b)[:8]
 }
 
 func (s *MeetingService) generateLiveKitToken(userID uuid.UUID, roomName string, canPublish bool) (string, error) {
-	grant := &lksdk.VideoGrants{
+	grant := &auth.VideoGrants{
 		RoomJoin:       true,
 		Room:           roomName,
 		CanPublish:     canPublish,

@@ -51,7 +51,8 @@ func (h *AuthHandler) Login(c *gin.Context) {
 
 func (h *AuthHandler) Logout(c *gin.Context) {
 	token := c.GetString("token")
-	h.authService.Logout(c.Request.Context(), token)
+	userID := c.MustGet("user_id").(uuid.UUID)
+	h.authService.Logout(c.Request.Context(), token, userID)
 	c.JSON(http.StatusOK, gin.H{"message": "logged out"})
 }
 

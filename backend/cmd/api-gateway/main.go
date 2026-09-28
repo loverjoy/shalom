@@ -19,66 +19,131 @@ import (
 	"shalom/internal/config"
 	"shalom/internal/handler"
 	"shalom/internal/middleware"
+	"shalom/internal/repository"
 	"shalom/internal/service"
 )
 
 func main() {
 	cfg := config.Load()
-
-	// Connect to PostgreSQL
 	ctx := context.Background()
-	pgPool, err := pgxpool.New(ctx, cfg.Database.PostgresURL)
+
+	// ============================================================
+	// DATABASE CONNECTIONS
+	// ============================================================
+
+	// PostgreSQL with connection pooling
+	pgConfig, err := pgxpool.ParseConfig(cfg.Database.PostgresURL)
+	if err != nil {
+		log.Fatalf("Unable to parse PostgreSQL config: %v", err)
+	}
+	pgConfig.MaxConns = 25
+	pgConfig.MinConns = 5
+	pgConfig.MaxConnLifetime = 30 * time.Minute
+	pgConfig.MaxConnIdleTime = 10 * time.Minute
+	pgConfig.HealthCheckPeriod = 5 * time.Minute
+
+	pgPool, err := pgxpool.NewWithConfig(ctx, pgConfig)
 	if err != nil {
 		log.Fatalf("Unable to connect to PostgreSQL: %v", err)
 	}
 	defer pgPool.Close()
-	log.Println("Connected to PostgreSQL")
 
-	// Connect to MongoDB
-	mongoClient, err := mongo.Connect(ctx, options.Client().ApplyURI(cfg.Database.MongoURL))
+	// Verify PostgreSQL connection
+	if err := pgPool.Ping(ctx); err != nil {
+		log.Fatalf("Unable to ping PostgreSQL: %v", err)
+	}
+	log.Println("Connected to PostgreSQL (pool: 5-25 connections)")
+
+	// MongoDB
+	mongoOpts := options.Client().ApplyURI(cfg.Database.MongoURL)
+	mongoOpts.SetMaxPoolSize(50)
+	mongoOpts.SetMinPoolSize(5)
+	mongoClient, err := mongo.Connect(ctx, mongoOpts)
 	if err != nil {
 		log.Fatalf("Unable to connect to MongoDB: %v", err)
 	}
 	defer mongoClient.Disconnect(ctx)
+
+	if err := mongoClient.Ping(ctx, nil); err != nil {
+		log.Fatalf("Unable to ping MongoDB: %v", err)
+	}
 	mongoDB := mongoClient.Database(cfg.Database.MongoDB)
 	log.Println("Connected to MongoDB")
 
-	// Connect to Redis
+	// Redis with connection pooling
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     cfg.Redis.Addr,
-		Password: cfg.Redis.Password,
-		DB:       cfg.Redis.DB,
+		Addr:         cfg.Redis.Addr,
+		Password:     cfg.Redis.Password,
+		DB:           cfg.Redis.DB,
+		PoolSize:     20,
+		MinIdleConns: 5,
+		PoolTimeout:  30 * time.Second,
 	})
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		log.Fatalf("Unable to connect to Redis: %v", err)
 	}
 	log.Println("Connected to Redis")
 
-	// Initialize middleware
-	authMiddleware := middleware.NewAuthMiddleware(cfg.JWT.Secret, rdb)
+	// ============================================================
+	// REPOSITORIES
+	// ============================================================
 
-	// Initialize services
-	authService := service.NewAuthService(pgPool, rdb, authMiddleware)
-	meetingService := service.NewMeetingService(pgPool, cfg)
+	repos := repository.NewRepositories(pgPool)
+
+	// ============================================================
+	// SERVICES
+	// ============================================================
+
+	authMiddleware := middleware.NewAuthMiddleware(cfg.JWT.Secret, rdb)
+	authService := service.NewAuthService(rdb, authMiddleware, repos.User)
+	meetingService := service.NewMeetingService(cfg, repos.Meeting)
 	chatService := service.NewChatService(mongoDB)
 	bandwidthOptimizer := service.NewBandwidthOptimizer(rdb)
 
-	// Initialize handlers
+	// ============================================================
+	// HANDLERS
+	// ============================================================
+
 	authHandler := handler.NewAuthHandler(authService)
 	meetingHandler := handler.NewMeetingHandler(meetingService)
 	chatHandler := handler.NewChatHandler(chatService)
 	bandwidthHandler := handler.NewBandwidthHandler(bandwidthOptimizer)
 
-	// Setup Gin router
+	// ============================================================
+	// ROUTER
+	// ============================================================
+
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(middleware.CORS())
 	r.Use(middleware.RateLimit(rdb, 100, time.Minute))
 
-	// Health check
+	// Health endpoints
 	r.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "service": "shalom"})
+		dbOK := pgPool.Ping(c.Request.Context()) == nil
+		redisOK := rdb.Ping(c.Request.Context()).Err() == nil
+		status := "ok"
+		code := http.StatusOK
+		if !dbOK || !redisOK {
+			status = "degraded"
+			code = http.StatusServiceUnavailable
+		}
+		c.JSON(code, gin.H{
+			"status":     status,
+			"service":    "shalom",
+			"postgres":   dbOK,
+			"redis":      redisOK,
+			"uptime":     time.Since(startTime).String(),
+		})
+	})
+
+	r.GET("/health/ready", func(c *gin.Context) {
+		if err := pgPool.Ping(c.Request.Context()); err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "postgres not ready"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "ready"})
 	})
 
 	// Public routes
@@ -154,3 +219,5 @@ func main() {
 	}
 	log.Println("Server exited")
 }
+
+var startTime = time.Now()

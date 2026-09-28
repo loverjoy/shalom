@@ -2,28 +2,26 @@ package service
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/bcrypt"
 
 	"shalom/internal/middleware"
 	"shalom/internal/models"
+	"shalom/internal/repository"
 )
 
 type AuthService struct {
-	db    *pgxpool.Pool
-	rdb   *redis.Client
-	auth  *middleware.AuthMiddleware
+	rdb      *redis.Client
+	auth     *middleware.AuthMiddleware
+	userRepo *repository.UserRepository
 }
 
-func NewAuthService(db *pgxpool.Pool, rdb *redis.Client, auth *middleware.AuthMiddleware) *AuthService {
-	return &AuthService{db: db, rdb: rdb, auth: auth}
+func NewAuthService(rdb *redis.Client, auth *middleware.AuthMiddleware, userRepo *repository.UserRepository) *AuthService {
+	return &AuthService{rdb: rdb, auth: auth, userRepo: userRepo}
 }
 
 type RegisterRequest struct {
@@ -49,35 +47,47 @@ func (s *AuthService) Register(ctx context.Context, req RegisterRequest) (*AuthR
 		return nil, err
 	}
 
-	var user models.User
-	err = s.db.QueryRow(ctx,
-		`INSERT INTO users (id, email, username, display_name, password_hash, status, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, 'online', NOW(), NOW())
-		 RETURNING id, email, username, display_name, avatar_url, status, last_seen, created_at, updated_at`,
-		uuid.New(), req.Email, req.Username, req.DisplayName, string(hash),
-	).Scan(&user.ID, &user.Email, &user.Username, &user.DisplayName, &user.AvatarURL, &user.Status, &user.LastSeen, &user.CreatedAt, &user.UpdatedAt)
-	if err != nil {
+	user := &models.User{
+		ID:           uuid.New(),
+		Email:        req.Email,
+		Username:     req.Username,
+		DisplayName:  req.DisplayName,
+		PasswordHash: string(hash),
+		Status:       models.UserOnline,
+	}
+
+	if err := s.userRepo.Create(ctx, user); err != nil {
 		return nil, errors.New("email or username already exists")
 	}
+
+	// Create default settings
+	settings := &models.UserSettings{
+		UserID:              user.ID,
+		NotificationsEnabled: true,
+		SoundEnabled:         true,
+		DefaultBandwidth:     models.ModeStandard,
+		Language:             "en",
+		Theme:                "dark",
+		AutoReconnect:        true,
+		ShowOnlineStatus:     true,
+		AllowDirectMessages:  true,
+		CameraDefaultOn:      false,
+		MicDefaultMuted:      true,
+	}
+	s.userRepo.UpsertSettings(ctx, settings)
 
 	token, err := s.auth.GenerateToken(user.ID, user.Username, user.Email)
 	if err != nil {
 		return nil, err
 	}
 
-	// Store session in Redis for presence
 	s.rdb.Set(ctx, "session:"+user.ID.String(), "online", 72*time.Hour)
 
-	return &AuthResponse{Token: token, User: user}, nil
+	return &AuthResponse{Token: token, User: *user}, nil
 }
 
 func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*AuthResponse, error) {
-	var user models.User
-	err := s.db.QueryRow(ctx,
-		`SELECT id, email, username, display_name, password_hash, avatar_url, status, last_seen, created_at, updated_at
-		 FROM users WHERE email = $1`,
-		req.Email,
-	).Scan(&user.ID, &user.Email, &user.Username, &user.DisplayName, &user.PasswordHash, &user.AvatarURL, &user.Status, &user.LastSeen, &user.CreatedAt, &user.UpdatedAt)
+	user, err := s.userRepo.GetByEmail(ctx, req.Email)
 	if err != nil {
 		return nil, errors.New("invalid credentials")
 	}
@@ -86,38 +96,60 @@ func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*AuthRespons
 		return nil, errors.New("invalid credentials")
 	}
 
+	s.userRepo.UpdateStatus(ctx, user.ID, models.UserOnline)
+	s.rdb.Set(ctx, "session:"+user.ID.String(), "online", 72*time.Hour)
+
 	token, err := s.auth.GenerateToken(user.ID, user.Username, user.Email)
 	if err != nil {
 		return nil, err
 	}
 
-	// Update online status
-	s.db.Exec(ctx, `UPDATE users SET status = 'online', last_seen = NOW() WHERE id = $1`, user.ID)
-	s.rdb.Set(ctx, "session:"+user.ID.String(), "online", 72*time.Hour)
-
-	user.Status = "online"
-	return &AuthResponse{Token: token, User: user}, nil
+	user.Status = models.UserOnline
+	return &AuthResponse{Token: token, User: *user}, nil
 }
 
-func (s *AuthService) Logout(ctx context.Context, token string) error {
+func (s *AuthService) Logout(ctx context.Context, token string, userID uuid.UUID) error {
 	s.auth.BlacklistToken(token)
+	s.userRepo.UpdateStatus(ctx, userID, models.UserOffline)
+	s.rdb.Del(ctx, "session:"+userID.String())
 	return nil
 }
 
 func (s *AuthService) GetProfile(ctx context.Context, userID uuid.UUID) (*models.User, error) {
-	var user models.User
-	err := s.db.QueryRow(ctx,
-		`SELECT id, email, username, display_name, avatar_url, status, last_seen, created_at, updated_at
-		 FROM users WHERE id = $1`, userID,
-	).Scan(&user.ID, &user.Email, &user.Username, &user.DisplayName, &user.AvatarURL, &user.Status, &user.LastSeen, &user.CreatedAt, &user.UpdatedAt)
+	return s.userRepo.GetByID(ctx, userID)
+}
+
+func (s *AuthService) UpdateProfile(ctx context.Context, userID uuid.UUID, displayName, avatarURL, bio, phone string) (*models.User, error) {
+	user, err := s.userRepo.GetByID(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
-	return &user, nil
+	if displayName != "" {
+		user.DisplayName = displayName
+	}
+	if avatarURL != "" {
+		user.AvatarURL = avatarURL
+	}
+	if bio != "" {
+		user.Bio = bio
+	}
+	if phone != "" {
+		user.Phone = phone
+	}
+	if err := s.userRepo.Update(ctx, user); err != nil {
+		return nil, err
+	}
+	return user, nil
 }
 
-func generateMeetingCode() string {
-	b := make([]byte, 4)
-	rand.Read(b)
-	return hex.EncodeToString(b)[:8]
+func (s *AuthService) SearchUsers(ctx context.Context, query string) ([]models.User, error) {
+	return s.userRepo.Search(ctx, query, 20)
+}
+
+func (s *AuthService) GetSettings(ctx context.Context, userID uuid.UUID) (*models.UserSettings, error) {
+	return s.userRepo.GetSettings(ctx, userID)
+}
+
+func (s *AuthService) UpdateSettings(ctx context.Context, settings *models.UserSettings) error {
+	return s.userRepo.UpsertSettings(ctx, settings)
 }

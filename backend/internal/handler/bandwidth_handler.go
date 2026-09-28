@@ -54,7 +54,7 @@ func (h *BandwidthHandler) ReportNetwork(c *gin.Context) {
 
 	userID := c.MustGet("user_id").(uuid.UUID)
 	condition := h.bandwidth.DetectNetworkCondition(c.Request.Context(), userID, req.BandwidthKbps)
-	profile := h.bandwidth.GetProfile(c.Request.Context(), userID)
+	profile, _ := h.bandwidth.GetProfile(c.Request.Context(), userID)
 
 	c.JSON(http.StatusOK, gin.H{
 		"condition": condition,
